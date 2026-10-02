@@ -9,7 +9,7 @@ const {
   GovernanceSyncWorker,
   EnsGovernorSource,
   RailgunVotingSource,
-  NounsSubgraphSource,
+  NounsRpcSource,
   createReadOnlyApi,
 } = require("../src");
 const { redactErrorMessage } = require("../src/redaction");
@@ -94,7 +94,7 @@ function buildRuntime(db) {
     if (!rpcUrl) throw new Error("ETHEREUM_RPC_URL is required for canonical block provenance");
     provider = new JsonRpcProvider(rpcUrl, 1, { staticNetwork: true });
   }
-  if (daoIds.includes("nouns")) sources.nouns = new NounsSubgraphSource({ ...common, provider });
+  if (daoIds.includes("nouns")) sources.nouns = new NounsRpcSource({ ...common, provider, rpcUrl });
   if (daoIds.includes("ens")) {
     sources.ens = new EnsGovernorSource({ ...common, provider, rpcUrl, fromBlock: DAO_CONFIGS.ens.fromBlock });
   }

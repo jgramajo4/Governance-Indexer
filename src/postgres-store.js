@@ -17,6 +17,7 @@ const { redactErrorMessage } = require("./redaction");
 const { canonicalGateActions } = require("./gate-action");
 const { canonicalCandidateTarget } = require("./candidate-target");
 const { DAO_CONFIGS } = require("./config");
+const { proposalContentHash } = require("./domain/nouns-history");
 
 // A WARM proposal (succeeded, queued) can still change, but not on the cadence a
 // live vote does. Re-reading it once a quarter hour is enough and keeps a steady
@@ -84,7 +85,11 @@ class PostgresTransaction {
       INSERT INTO governance_sources(dao_id,id,kind,endpoint,from_block,config)
       VALUES($1,$2,$3,$4,$5,$6)
       ON CONFLICT(dao_id,id) DO UPDATE SET
-        kind=excluded.kind,endpoint=excluded.endpoint,from_block=excluded.from_block,config=excluded.config
+        kind=excluded.kind,endpoint=excluded.endpoint,from_block=excluded.from_block,
+        config=excluded.config || (governance_sources.config - 'rpcCutoverBlock') ||
+          CASE WHEN governance_sources.config ? 'rpcCutoverBlock'
+            THEN jsonb_build_object('rpcCutoverBlock',governance_sources.config->'rpcCutoverBlock')
+            ELSE '{}'::jsonb END
     `, [safeRow.daoId, safeRow.id, safeRow.kind, safeRow.endpoint, safeRow.fromBlock, safeRow]);
   }
 
@@ -100,6 +105,82 @@ class PostgresTransaction {
         last_full_scan_at=COALESCE(excluded.last_full_scan_at,sync_checkpoints.last_full_scan_at),
         last_error=excluded.last_error
     `, [row.daoId, row.sourceId, row.nextBlock, row.finalizedHead, row.lastFullScanAt || null, lastError]);
+  }
+
+  async freezeRpcCutoverBlock(daoId, sourceId, fromBlock) {
+    if (daoId !== "nouns" || sourceId !== "nouns-subgraph"
+        || !Number.isSafeInteger(Number(fromBlock)) || Number(fromBlock) < 0) {
+      throw new TypeError("invalid Nouns RPC cutover boundary");
+    }
+    await this.client.query(`
+      UPDATE governance_sources
+      SET config=jsonb_set(config,'{rpcCutoverBlock}',to_jsonb($3::bigint),true)
+      WHERE dao_id=$1 AND id=$2 AND NOT (config ? 'rpcCutoverBlock')
+    `, [daoId, sourceId, fromBlock]);
+  }
+
+  async setCandidateSnapshot({ daoId, sourceId, checkpointBlock, checkpointHash, snapshot }) {
+    if (!Number.isSafeInteger(checkpointBlock) || checkpointBlock < 0
+        || typeof checkpointHash !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(checkpointHash)
+        || snapshot?.snapshot !== checkpointBlock || snapshot?.blockHash !== checkpointHash) {
+      throw new TypeError("candidate snapshot checkpoint provenance is invalid");
+    }
+    await this.client.query(`
+      INSERT INTO candidate_snapshots(dao_id,source_id,checkpoint_block,checkpoint_hash,snapshot)
+      VALUES($1,$2,$3,$4,$5)
+      ON CONFLICT(dao_id,source_id) DO UPDATE SET
+        checkpoint_block=excluded.checkpoint_block,checkpoint_hash=excluded.checkpoint_hash,
+        snapshot=excluded.snapshot,updated_at=now()
+      WHERE candidate_snapshots.checkpoint_block<=excluded.checkpoint_block
+    `, [daoId, sourceId, checkpointBlock, checkpointHash, JSON.stringify(snapshot)]);
+  }
+
+  async refreshMaterializedProposal({ daoId, sourceId, proposalId, contentHash, snapshot, payload }) {
+    if (daoId !== "nouns" || sourceId !== "nouns-subgraph"
+        || !/^(0|[1-9][0-9]*)$/.test(String(proposalId))
+        || !/^[0-9a-fA-F]{64}$/.test(contentHash || "")
+        || !/^0x[0-9a-fA-F]{64}$/.test(snapshot?.blockHash || "")
+        || !Number.isSafeInteger(snapshot.blockNumber) || snapshot.blockNumber < 0
+        || !payload || typeof payload !== "object" || Array.isArray(payload)
+        || String(payload.id) !== String(proposalId) || typeof payload.description !== "string"
+        || !["targets", "values", "signatures", "calldatas"].every((key) => Array.isArray(payload[key]))
+        || !["values", "signatures", "calldatas"].every((key) => payload[key].length === payload.targets.length)
+        || proposalContentHash(payload) !== contentHash) {
+      throw new TypeError("invalid materialized Nouns proposal provenance");
+    }
+    // Lock the original evidence, but never relabel it. Refresh evidence lives
+    // separately, keyed by canonical proposal identity and chain snapshot.
+    const selected = await this.client.query(`
+      SELECT block_number,observed_head,block_hash,content_hash
+      FROM raw_governance_records
+      WHERE dao_id=$1 AND source_id=$2 AND source_record_key='proposal:' || $3
+        AND record_type='proposal' AND proposal_id::text=$3
+      FOR UPDATE
+    `, [daoId, sourceId, String(proposalId)]);
+    const row = selected.rows[0];
+    if (!row || BigInt(row.block_number) > BigInt(snapshot.blockNumber)
+        || BigInt(row.observed_head) > BigInt(snapshot.blockNumber)
+        || (BigInt(row.block_number) === BigInt(snapshot.blockNumber)
+          && row.block_hash === snapshot.blockHash && row.content_hash !== contentHash)) {
+      throw new Error(`materialized Nouns proposal provenance is stale or missing for ${proposalId}`);
+    }
+    const previous = (await this.client.query(`
+      SELECT block_number,block_hash,content_hash,payload FROM nouns_proposal_refreshes
+      WHERE dao_id=$1 AND source_id=$2 AND proposal_id=$3 FOR UPDATE
+    `, [daoId, sourceId, proposalId])).rows[0];
+    if (previous && (BigInt(previous.block_number) > BigInt(snapshot.blockNumber)
+      || (BigInt(previous.block_number) === BigInt(snapshot.blockNumber)
+        && previous.block_hash === snapshot.blockHash
+        && (previous.content_hash !== contentHash || !isDeepStrictEqual(previous.payload, payload))))) {
+      throw new Error(`materialized Nouns proposal provenance is stale or conflicting for ${proposalId}`);
+    }
+    await this.client.query(`
+      INSERT INTO nouns_proposal_refreshes(dao_id,source_id,proposal_id,block_number,block_hash,content_hash,payload)
+      VALUES($1,$2,$3,$4,$5,$6,$7)
+      ON CONFLICT(dao_id,source_id,proposal_id) DO UPDATE SET
+        block_number=excluded.block_number,block_hash=excluded.block_hash,
+        content_hash=excluded.content_hash,payload=excluded.payload,ingested_at=now()
+    `, [daoId, sourceId, proposalId, snapshot.blockNumber, snapshot.blockHash, contentHash, payload]);
   }
 
   async upsertProposal(row) {
@@ -235,24 +316,72 @@ class PostgresTransaction {
       ]);
       const existing = (await this.client.query(`
         SELECT block_number AS "blockNumber",observed_head AS "observedHead",block_hash AS "blockHash",record_type AS "recordType",
-          proposal_id::text AS "proposalId",content_hash AS "contentHash",payload
+          proposal_id::text AS "proposalId",content_hash AS "contentHash",payload,
+          external_id AS "externalId",chain_id AS "chainId",contract_address AS "contractAddress",source_kind AS "sourceKind"
         FROM raw_governance_records WHERE dao_id=$1 AND source_id=$2 AND source_record_key=$3
       `, [raw.daoId, raw.sourceId, raw.sourceRecordKey])).rows[0];
       if (existing) {
-        if (!isDeepStrictEqual(immutableEventMaterial(existing), immutableEventMaterial(raw))) {
+        const rpcRefresh = raw.daoId === "nouns" && raw.sourceId === "nouns-subgraph"
+          && (raw.sourceKind === "nouns-governor-logs" || raw.sourceKind === "nouns-rpc")
+          && /^0x[0-9a-fA-F]{64}$/.test(raw.blockHash || "")
+          && record.proposal?.contentHash === raw.contentHash;
+        const changed = !isDeepStrictEqual(immutableEventMaterial(existing), immutableEventMaterial(raw));
+        if (!rpcRefresh && !changed) {
+          const refreshed = await this.client.query(`
+            UPDATE raw_governance_records
+            SET block_number=$4,block_hash=$5,observed_head=$6,ingested_at=now()
+            WHERE dao_id=$1 AND source_id=$2 AND source_record_key=$3
+              AND block_number<=$4 AND observed_head<=$6
+          `, [raw.daoId, raw.sourceId, raw.sourceRecordKey, raw.blockNumber, raw.blockHash, raw.observedHead]);
+          if (refreshed.rowCount === 0) return false;
+          result = { rowCount: 0 };
+        } else {
+        const cutover = raw.daoId === "nouns" && raw.sourceId === "nouns-subgraph"
+          ? (await this.client.query("SELECT config->>'rpcCutoverBlock' AS block FROM governance_sources WHERE dao_id=$1 AND id=$2", [raw.daoId, raw.sourceId])).rows[0]?.block
+          : null;
+        const historical = existing.sourceKind === 'nouns-subgraph'
+          || (cutover != null && BigInt(existing.blockNumber) < BigInt(cutover));
+        if ((existing.proposalId != null && existing.proposalId !== raw.proposalId)
+            || (existing.externalId != null && existing.externalId !== raw.externalId)
+            || (existing.chainId != null && Number(existing.chainId) !== Number(raw.chainId))
+            || (existing.contractAddress != null
+              && String(existing.contractAddress).toLowerCase() !== String(raw.contractAddress).toLowerCase())) {
+          throw new Error(`canonical proposal identity drift for ${eventKey(raw)}`);
+        }
+        if (BigInt(raw.blockNumber) < BigInt(existing.blockNumber)
+            || BigInt(raw.observedHead) < BigInt(existing.observedHead)) return false;
+        if (historical && rpcRefresh) {
+          // A materialized refresh carries no raw payload. A purported new raw
+          // event for a pre-cutover key cannot replace its original evidence.
+          if (changed) throw new Error(`canonical event drift for ${eventKey(raw)}`);
+          return false;
+        }
+        if (historical && existing.contentHash === raw.contentHash && existing.blockHash === raw.blockHash) {
+          if (record.proposal) await this.upsertProposal(record.proposal);
+          return false;
+        }
+        // The same canonical block cannot change content. A different hash at
+        // the same height is a reorg; higher snapshots can carry RPC updates.
+        if (changed && (!rpcRefresh || (String(existing.blockNumber) === String(raw.blockNumber)
+          && existing.blockHash === raw.blockHash))) {
           throw new Error(`canonical event drift for ${eventKey(raw)}`);
         }
         const refreshed = await this.client.query(`
           UPDATE raw_governance_records
-          SET block_number=$4,block_hash=$5,observed_head=$6,ingested_at=now()
+          SET block_number=$4,block_hash=$5,observed_head=$6,content_hash=$7,
+            payload=$8,ingested_at=now()
           WHERE dao_id=$1 AND source_id=$2 AND source_record_key=$3
             AND block_number<=$4 AND observed_head<=$6
-        `, [raw.daoId, raw.sourceId, raw.sourceRecordKey, raw.blockNumber, raw.blockHash, raw.observedHead]);
-        // Same-height replacement is deliberate reorg handling. A zero-row
-        // update means a newer snapshot won the race, so do not regress its
-        // normalized proposal state below.
-        if (refreshed.rowCount === 0) return false;
+            AND (block_number<$4 OR block_hash IS DISTINCT FROM $5 OR observed_head<$6)
+        `, [raw.daoId, raw.sourceId, raw.sourceRecordKey, raw.blockNumber, raw.blockHash, raw.observedHead,
+          raw.contentHash, raw.payload]);
+        if (refreshed.rowCount === 0) {
+          // No provenance change is needed for a repeat at the same block.
+          if (String(existing.blockNumber) !== String(raw.blockNumber)
+              || existing.blockHash !== raw.blockHash || existing.contentHash !== raw.contentHash) return false;
+        }
         result = { rowCount: 0 };
+        }
       }
     }
     if (!result) result = await this.client.query(`
@@ -277,7 +406,7 @@ class PostgresTransaction {
     return result.rowCount > 0;
   }
 
-  async reconcileRange({ daoId, sourceId, fromBlock, toBlock, records }) {
+  async reconcileRange({ daoId, sourceId, fromBlock, toBlock, records, cutoverBlock = null }) {
     const incoming = new Map(records.map((record) => {
       const row = rawRow(record);
       return [eventKey(row), row];
@@ -290,8 +419,9 @@ class PostgresTransaction {
         proposal_id::text AS "proposalId",content_hash AS "contentHash",payload
       FROM raw_governance_records
       WHERE dao_id=$1 AND source_id=$2 AND block_number BETWEEN $3 AND $4
+        AND ($5::bigint IS NULL OR block_number >= $5)
         AND NOT (record_type='proposal' AND source_record_key IS NOT NULL)
-    `, [daoId, sourceId, fromBlock, toBlock]);
+    `, [daoId, sourceId, fromBlock, toBlock, cutoverBlock]);
     const existingByKey = new Map(selected.rows.map((row) => [eventKey(row), row]));
 
     const chainRows = [...incoming.values()].filter((row) => !row.sourceRecordKey);
@@ -337,7 +467,8 @@ class PostgresTransaction {
 
     for (const [key, next] of incoming) {
       const existing = existingByKey.get(key);
-      if (existing && !isDeepStrictEqual(immutableEventMaterial(existing), immutableEventMaterial(next))) {
+      if (existing && (cutoverBlock == null || BigInt(existing.blockNumber) >= BigInt(cutoverBlock))
+          && !isDeepStrictEqual(immutableEventMaterial(existing), immutableEventMaterial(next))) {
         throw new Error(`canonical event drift for ${key}`);
       }
     }
@@ -345,7 +476,8 @@ class PostgresTransaction {
     const removals = new Map(selected.rows.filter((row) => !incoming.has(eventKey(row))).map((row) => [eventKey(row), row]));
     for (const [key, next] of incoming) {
       const existing = existingByKey.get(key);
-      if (existing && (String(existing.blockNumber) !== String(next.blockNumber) || (existing.blockHash || null) !== (next.blockHash || null))) removals.set(key, existing);
+      if (existing && (cutoverBlock == null || BigInt(existing.blockNumber) >= BigInt(cutoverBlock))
+          && (String(existing.blockNumber) !== String(next.blockNumber) || (existing.blockHash || null) !== (next.blockHash || null))) removals.set(key, existing);
     }
     const removedProposalIds = new Set();
     for (const row of removals.values()) {
@@ -382,21 +514,64 @@ class PostgresTransaction {
     }
   }
 
-  async reconcileProposals({ daoId, sourceId, records }) {
+  async reconcileRpcProposals({ daoId, sourceId, fromBlock, toBlock, cutoverBlock, createdIds }) {
+    if (daoId !== 'nouns' || sourceId !== 'nouns-subgraph'
+        || ![fromBlock, toBlock].every((n) => Number.isSafeInteger(n) && n >= 0)
+        || fromBlock > toBlock || (cutoverBlock != null && (!Number.isSafeInteger(cutoverBlock) || cutoverBlock < 0))
+        || !Array.isArray(createdIds) || !createdIds.every((id) => /^(0|[1-9][0-9]*)$/.test(String(id)))) {
+      throw new TypeError('invalid RPC proposal reconciliation range');
+    }
+    const present = new Set(createdIds.map(String));
+    const rows = (await this.client.query(`
+      SELECT id,proposal_id::text AS "proposalId",
+        payload->>'createdBlock' AS "createdBlock"
+      FROM raw_governance_records
+      WHERE dao_id=$1 AND source_id=$2 AND record_type='proposal'
+        AND source_record_key='proposal:' || proposal_id::text
+        AND source_kind IN ('nouns-governor-logs','nouns-rpc')
+      FOR UPDATE
+    `, [daoId, sourceId])).rows;
+    for (const row of rows) {
+      if (row.createdBlock == null || !/^(0|[1-9][0-9]*)$/.test(row.createdBlock)) continue;
+      const created = BigInt(row.createdBlock);
+      if (created < BigInt(fromBlock) || created > BigInt(toBlock)
+          || created < BigInt(cutoverBlock ?? fromBlock) || present.has(row.proposalId)) continue;
+      await this.client.query('DELETE FROM raw_governance_records WHERE id=$1', [row.id]);
+      await this.client.query(`
+        DELETE FROM nouns_proposal_refreshes n WHERE n.dao_id=$1 AND n.source_id=$2 AND n.proposal_id=$3
+          AND NOT EXISTS (SELECT 1 FROM raw_governance_records r
+            WHERE r.dao_id=n.dao_id AND r.source_id=n.source_id AND r.proposal_id=n.proposal_id AND r.record_type='proposal')
+      `, [daoId, sourceId, row.proposalId]);
+      await this.client.query(`
+        DELETE FROM proposals p WHERE p.dao_id=$1 AND p.proposal_id=$2
+          AND NOT EXISTS (SELECT 1 FROM raw_governance_records r
+            WHERE r.dao_id=p.dao_id AND r.record_type='proposal' AND r.proposal_id=p.proposal_id)
+      `, [daoId, row.proposalId]);
+    }
+  }
+
+  async reconcileProposals({ daoId, sourceId, records, cutoverBlock = null }) {
     const incoming = new Map(records.map((record) => { const row = rawRow(record); return [eventKey(row), row]; }));
     const selected = await this.client.query(`
       SELECT dao_id AS "daoId",source_id AS "sourceId",source_record_key AS "sourceRecordKey",
         chain_id AS "chainId",contract_address AS "contractAddress",transaction_hash AS "transactionHash",
         log_index AS "logIndex",block_number AS "blockNumber",block_hash AS "blockHash",
-        record_type AS "recordType",proposal_id::text AS "proposalId",content_hash AS "contentHash",payload
+        record_type AS "recordType",proposal_id::text AS "proposalId",content_hash AS "contentHash",payload,
+        source_kind AS "sourceKind"
       FROM raw_governance_records
       WHERE dao_id=$1 AND source_id=$2 AND record_type='proposal' AND source_record_key IS NOT NULL
     `, [daoId, sourceId]);
     for (const row of selected.rows) {
       const next = incoming.get(eventKey(row));
-      if (next && !isDeepStrictEqual(immutableEventMaterial(row), immutableEventMaterial(next))) throw new Error(`canonical event drift for ${eventKey(row)}`);
+      if (next && (cutoverBlock == null || (BigInt(row.blockNumber) >= BigInt(cutoverBlock)
+          && row.sourceKind !== "nouns-subgraph"))
+          && !(daoId === "nouns" && sourceId === "nouns-subgraph"
+            && ["nouns-rpc", "nouns-governor-logs"].includes(next.sourceKind))
+          && !isDeepStrictEqual(immutableEventMaterial(row), immutableEventMaterial(next))) throw new Error(`canonical event drift for ${eventKey(row)}`);
     }
-    for (const row of selected.rows.filter((candidate) => !incoming.has(eventKey(candidate)))) {
+    for (const row of selected.rows.filter((candidate) => !incoming.has(eventKey(candidate))
+        && (cutoverBlock == null || (BigInt(candidate.blockNumber) >= BigInt(cutoverBlock)
+          && candidate.sourceKind !== "nouns-subgraph")))) {
       await this.client.query("DELETE FROM raw_governance_records WHERE dao_id=$1 AND source_id=$2 AND source_record_key=$3", [daoId, sourceId, row.sourceRecordKey]);
       await this.client.query(`
         DELETE FROM proposals p WHERE p.dao_id=$1 AND p.proposal_id=$2
@@ -452,7 +627,10 @@ class PostgresGovernanceStore {
     await this.pool.query(await fs.readFile(path.join(dir, "001_initial.sql"), "utf8"));
     await this.pool.query(await fs.readFile(path.join(dir, "003_proposal_lifecycle.sql"), "utf8"));
     await this.pool.query(await fs.readFile(path.join(dir, "004_nouns_candidates.sql"), "utf8"));
-    const versions = ["001_initial", "003_proposal_lifecycle", "004_nouns_candidates"];
+    await this.pool.query(await fs.readFile(path.join(dir, "005_nouns_rpc_cutover.sql"), "utf8"));
+    await this.pool.query(await fs.readFile(path.join(dir, "006_nouns_candidate_cache.sql"), "utf8"));
+    await this.pool.query(await fs.readFile(path.join(dir, "007_nouns_proposal_refresh.sql"), "utf8"));
+    const versions = ["001_initial", "003_proposal_lifecycle", "004_nouns_candidates", "005_nouns_rpc_cutover", "006_nouns_candidate_cache", "007_nouns_proposal_refresh"];
 
     // Role creation is idempotent and privilege-aware: on a fresh volume the
     // entrypoint script has already made the roles, on a reused volume this is
@@ -566,6 +744,21 @@ class PostgresGovernanceStore {
     return result.rows[0] || null;
   }
 
+  async getCandidateSnapshot(daoId, sourceId) {
+    const result = await this.pool.query(`
+      SELECT checkpoint_block::text AS "checkpointBlock",checkpoint_hash AS "checkpointHash",snapshot
+      FROM candidate_snapshots WHERE dao_id=$1 AND source_id=$2
+    `, [daoId, sourceId]);
+    const row = result.rows[0];
+    return row ? { ...row, checkpointBlock: Number(row.checkpointBlock) } : null;
+  }
+
+  async getRpcCutoverBlock(daoId, sourceId) {
+    if (daoId !== "nouns" || sourceId !== "nouns-subgraph") return null;
+    const row = (await this.pool.query("SELECT config->>'rpcCutoverBlock' AS block FROM governance_sources WHERE dao_id=$1 AND id=$2", [daoId, sourceId])).rows[0];
+    return row?.block == null ? null : Number(row.block);
+  }
+
   // Feeds incremental proposal enumeration: the highest indexed proposal id and
   // the proposals whose state can still change.
   async getProposalSyncContext(daoId, options = {}) {
@@ -655,11 +848,16 @@ class PostgresGovernanceStore {
         ),'[]'::jsonb) AS actions
       FROM proposals p
       JOIN LATERAL (
-        SELECT r.block_number,r.block_hash,r.ingested_at FROM raw_governance_records r
-        WHERE r.dao_id=p.dao_id AND r.proposal_id=p.proposal_id
-          AND r.source_id='nouns-subgraph' AND r.source_record_key='proposal:' || p.proposal_id::text
-          AND r.record_type='proposal' AND r.content_hash=p.content_hash AND r.block_hash IS NOT NULL
-        ORDER BY r.block_number DESC,r.id DESC LIMIT 1
+        SELECT evidence.block_number,evidence.block_hash,evidence.ingested_at FROM (
+          SELECT r.block_number,r.block_hash,r.ingested_at FROM raw_governance_records r
+          WHERE r.dao_id=p.dao_id AND r.proposal_id=p.proposal_id
+            AND r.source_id='nouns-subgraph' AND r.source_record_key='proposal:' || p.proposal_id::text
+            AND r.record_type='proposal' AND r.content_hash=p.content_hash AND r.block_hash IS NOT NULL
+          UNION ALL
+          SELECT n.block_number,n.block_hash,n.ingested_at FROM nouns_proposal_refreshes n
+          WHERE n.dao_id=p.dao_id AND n.source_id='nouns-subgraph' AND n.proposal_id=p.proposal_id
+            AND n.content_hash=p.content_hash AND n.payload->>'description'=p.normalized->>'description'
+        ) evidence ORDER BY evidence.block_number DESC,evidence.ingested_at DESC LIMIT 1
       ) provenance ON true
       WHERE p.dao_id=$1 AND p.proposal_id=$2
     `, [daoId, id])).rows[0];

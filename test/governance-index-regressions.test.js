@@ -229,7 +229,7 @@ test("one DAO refresh failure does not starve peers and recovers on the next cyc
   const nounsHash = `0x${"aa".repeat(32)}`;
   const sources = {
     nouns: {
-      id: "nouns-subgraph", fromBlock: 1, replayBlocks: 0, config: DAO_CONFIGS.nouns,
+      id: "nouns-subgraph", fromBlock: 1, replayBlocks: 0, config: { ...DAO_CONFIGS.nouns, source: { ...DAO_CONFIGS.nouns.source, kind: "nouns-subgraph" } },
       async head() { attempts.nouns += 1; return heads.nouns; },
       async fetchProposals() { return snapshotRows([], heads.nouns, nounsHash); },
       async fetchCandidates() { candidateReads += 1; return snapshotRows([], heads.nouns, nounsHash); },
@@ -332,7 +332,7 @@ test("Nouns proposal records reconcile independently and disappearing proposals 
   const proposal = { daoId: "nouns", proposalId: "7", contentHash: "a".repeat(64), normalized: { id: "7", contentHash: "a".repeat(64), createdBlock: "100" }, actions: [] };
   const record = { raw: { daoId: "nouns", sourceId: "nouns-subgraph", sourceRecordKey: "proposal:7", externalId: "7", chainId: 1, contractAddress: DAO_CONFIGS.nouns.contractAddress, transactionHash: null, logIndex: null, blockNumber: "100", blockHash: null, recordType: "proposal", proposalId: "7", contentHash: "a".repeat(64), payload: { id: "7", createdBlock: "100" }, sourceKind: "nouns-subgraph", sourceEndpoint: "https://subgraph.example/private", observedHead: "110" }, proposal };
   let proposals = [record];
-  const source = { id: "nouns-subgraph", fromBlock: 90, replayBlocks: 20, config: DAO_CONFIGS.nouns, rpcUrl: "https://subgraph.example/private", async head(){ return 110; }, async fetchRange(){ return []; }, async normalizeLog(){ throw new Error("unexpected vote"); }, async fetchProposals(){ return proposals; } };
+  const source = { id: "nouns-subgraph", fromBlock: 90, replayBlocks: 20, config: { ...DAO_CONFIGS.nouns, source: { ...DAO_CONFIGS.nouns.source, kind: "nouns-subgraph" } }, rpcUrl: "https://subgraph.example/private", async head(){ return 110; }, async fetchRange(){ return []; }, async normalizeLog(){ throw new Error("unexpected vote"); }, async fetchProposals(){ return proposals; } };
   const worker = new GovernanceSyncWorker({ store, sources: { nouns: source }, batchSize: 100 });
   await worker.syncDao("nouns");
   assert.equal(store.rawRecords.length, 1);
@@ -352,7 +352,7 @@ test("Nouns refreshes old normalized proposal state outside the replay creation 
   const store = new MemoryGovernanceStore();
   let state = "ACTIVE";
   const source = {
-    id: "nouns-subgraph", fromBlock: 90, replayBlocks: 20, config: DAO_CONFIGS.nouns, rpcUrl: "https://subgraph.example/private",
+    id: "nouns-subgraph", fromBlock: 90, replayBlocks: 20, config: { ...DAO_CONFIGS.nouns, source: { ...DAO_CONFIGS.nouns.source, kind: "nouns-subgraph" } }, rpcUrl: "https://subgraph.example/private",
     async head(){ return 500; }, async fetchRange(){ return []; }, async normalizeLog(){ throw new Error("unexpected vote"); },
     async fetchProposals(){ return [{ raw: { daoId: "nouns", sourceId: "nouns-subgraph", sourceRecordKey: "proposal:7", chainId: 1, contractAddress: DAO_CONFIGS.nouns.contractAddress, transactionHash: null, logIndex: null, blockNumber: "100", blockHash: null, recordType: "proposal", proposalId: "7", contentHash: "a".repeat(64), payload: { id: "7" }, sourceKind: "nouns-subgraph", sourceEndpoint: "https://subgraph.example/private", observedHead: "500" }, proposal: { daoId: "nouns", proposalId: "7", contentHash: "a".repeat(64), normalized: { id: "7", contentHash: "a".repeat(64), createdBlock: "100", state }, actions: [] } }]; },
   };
@@ -739,7 +739,8 @@ test("multiple DAO failures aggregate after peers are attempted", async () => {
   const store = new MemoryGovernanceStore();
   const attempts = [];
   const source = (dao, fail) => ({
-    id: DAO_CONFIGS[dao].source.id, fromBlock: 1, replayBlocks: 0, config: DAO_CONFIGS[dao],
+    id: DAO_CONFIGS[dao].source.id, fromBlock: 1, replayBlocks: 0,
+    config: dao === "nouns" ? { ...DAO_CONFIGS.nouns, source: { ...DAO_CONFIGS.nouns.source, kind: "nouns-subgraph" } } : DAO_CONFIGS[dao],
     async head() { attempts.push(dao); if (fail) throw new Error(`${dao} unavailable`); return 20; },
     async fetchProposals() { return []; }, async fetchRange() { return []; },
     async normalizeLog() { throw new Error("unexpected event"); },

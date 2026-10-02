@@ -22,6 +22,10 @@ class GovernanceSyncWorker {
     const safeError = redactErrorMessage(error);
     try {
       const checkpoint = await this.store.getCheckpoint(daoId, source.id);
+      // A fresh RPC source has no committed cutover marker yet. Creating a
+      // failure-only checkpoint would make every subsequent attempt fail closed.
+      if (!checkpoint && daoId === "nouns" && source.id === "nouns-subgraph"
+          && source.config.source.kind === "nouns-rpc") return;
       await this.store.transaction(async (tx) => tx.setCheckpoint({
         daoId,
         sourceId: source.id,
@@ -119,6 +123,19 @@ class GovernanceSyncWorker {
       await tx.upsertSource({ daoId, id: source.id, kind: source.config.source.kind, endpoint: source.rpcUrl || source.config.source.endpoint, publicEndpoint: source.publicEndpoint, fromBlock: source.fromBlock });
     });
     const checkpoint = await this.store.getCheckpoint(daoId, source.id);
+    const cutoverBlock = daoId === "nouns" && source.id === "nouns-subgraph" && this.store.getRpcCutoverBlock
+      ? await this.store.getRpcCutoverBlock(daoId, source.id) : null;
+    if (daoId === "nouns" && source.id === "nouns-subgraph" && source.config.source.kind === "nouns-rpc") {
+      if (cutoverBlock == null && checkpoint) throw new Error("Nouns RPC cutover marker is missing for existing checkpoint");
+      source.cutoverBlock = cutoverBlock ?? source.fromBlock;
+    } else if (cutoverBlock != null) source.cutoverBlock = cutoverBlock;
+    if (daoId === "nouns" && source.id === "nouns-subgraph" && typeof source.hydrateCandidateCache === "function") {
+      const stored = await this.store.getCandidateSnapshot(daoId, source.id);
+      if (stored && (!checkpoint || Number(stored.checkpointBlock) > Number(checkpoint.finalizedHead))) {
+        throw new Error("candidate snapshot exceeds committed checkpoint");
+      }
+      if (stored) source.hydrateCandidateCache(stored.snapshot);
+    }
     const start = options.fromBlock == null ? (checkpoint ? Math.max(source.fromBlock, Number(checkpoint.nextBlock) - source.replayBlocks - 1) : source.fromBlock) : Math.max(source.fromBlock, Number(options.fromBlock));
     const finalHead = options.toBlock == null ? await source.head() : Number(options.toBlock);
     let batches = 0; let records = 0;
@@ -126,7 +143,14 @@ class GovernanceSyncWorker {
     // A full enumeration is the only pass that may conclude a proposal has
     // disappeared, so it is also the only pass allowed to reconcile deletions.
     const full = this._shouldFullScan(checkpoint, options);
-    const proposalContext = { full, ...(await this._proposalContext(daoId, full)) };
+    // An RPC "full" pass cannot re-enumerate pre-cutover chain history. It still
+    // needs the stored hot/warm refresh set, or open proposals with no new logs
+    // would stop receiving pinned state/tally updates every scheduled full pass.
+    const nounsRpc = daoId === "nouns" && source.id === "nouns-subgraph" && source.config.source.kind === "nouns-rpc";
+    const proposalContext = { full, rpcCutoverBlock: cutoverBlock, ...(await this._proposalContext(daoId, full && !nounsRpc)) };
+    if (nounsRpc) {
+      proposalContext.loadProposal = (id) => this.store.getProposal(daoId, id);
+    }
     const previousLifecycle = new Map((proposalContext.refreshProposals || []).map((row) => [String(row.proposalId), { effectiveStatus: row.effectiveStatus ?? row.normalized?.effectiveStatus ?? null, trackingState: row.trackingState ?? row.normalized?.trackingState ?? null }]));
     this.logger.info({ event: "proposal_refresh_plan", dao: daoId, source: source.id, mode: full ? "full" : "incremental", head: finalHead, upstreamRefresh: proposalContext.refreshProposals.length, locallyTerminalized: proposalContext.terminalized.length });
     // Terminalization is committed before any upstream call so a source outage
@@ -173,9 +197,11 @@ class GovernanceSyncWorker {
         while (true) { try { logs = await source.fetchRange(from, to, finalHead); break; } catch (error) { if (++attempt >= this.retries) throw error; this.logger.warn({ event: "sync_retry", dao: daoId, source: source.id, fromBlock: from, toBlock: to, attempt, error: redactErrorMessage(error) }); await new Promise((resolve) => setTimeout(resolve, 250 * 2 ** (attempt - 1))); } }
         const normalized = [];
         for (let index = 0; index < logs.length; index += this.concurrency) normalized.push(...await Promise.all(logs.slice(index, index + this.concurrency).map((entry) => source.normalizeLog(entry, finalHead))));
-        const canonicalRecords = normalized.map((record) => (record?.proposal ? { ...record, proposal: this._deriveProposal(record.proposal, finalHead) } : record));
+        const canonicalRecords = normalized
+          .filter((record) => cutoverBlock == null || BigInt(record.raw.blockNumber) >= BigInt(cutoverBlock))
+          .map((record) => (record?.proposal ? { ...record, proposal: this._deriveProposal(record.proposal, finalHead) } : record));
         await this.store.transaction(async (tx) => {
-          if (tx.reconcileRange) await tx.reconcileRange({ daoId, sourceId: source.id, fromBlock: from, toBlock: to, records: canonicalRecords });
+          if (tx.reconcileRange) await tx.reconcileRange({ daoId, sourceId: source.id, fromBlock: from, toBlock: to, records: canonicalRecords, cutoverBlock });
           for (const row of canonicalRecords) if (await tx.ingest(row)) records += 1;
           if (!enumeratesProposals) await tx.setCheckpoint({ daoId, sourceId: source.id, nextBlock: to + 1, finalizedHead: finalHead, updatedAt: new Date().toISOString(), lastError: null });
         });
@@ -191,20 +217,46 @@ class GovernanceSyncWorker {
     if (enumeratesProposals) {
       try {
         await this.store.transaction(async (tx) => {
+          if (nounsRpc) {
+            if (!tx.reconcileRpcProposals) throw new Error("Nouns RPC proposal reconciliation is required");
+            await tx.reconcileRpcProposals({ daoId, sourceId: source.id, fromBlock: start, toBlock: finalHead,
+              cutoverBlock: source.cutoverBlock, createdIds: proposalRecords.map((row) => String(row.proposal.proposalId)) });
+          }
           for (const proposal of materializedProposals) {
             const derived = this._deriveProposal(proposal.proposal || proposal, finalHead);
+            if (daoId === "nouns" && source.id === "nouns-subgraph" && source.config.source.kind === "nouns-rpc") {
+              await tx.refreshMaterializedProposal({ daoId, sourceId: source.id, proposalId: derived.proposalId,
+                contentHash: derived.contentHash, snapshot: fetchedProposals.snapshot, payload: proposal.payload });
+            }
             await tx.upsertProposal(derived);
             this._logLifecycleChange(daoId, previousLifecycle.get(String(derived.proposalId)), derived, full ? "full_enumeration" : "incremental_refresh");
           }
           const derivedRecords = proposalRecords.map((record) => ({ ...record, proposal: this._deriveProposal(record.proposal, finalHead) }));
           // Only a full enumeration is authoritative about which proposals exist.
-          if (full && tx.reconcileProposals) await tx.reconcileProposals({ daoId, sourceId: source.id, records: derivedRecords });
+          if (full && tx.reconcileProposals
+              && !(daoId === "nouns" && source.id === "nouns-subgraph" && source.config.source.kind === "nouns-rpc")) {
+            await tx.reconcileProposals({ daoId, sourceId: source.id, records: derivedRecords, cutoverBlock });
+          }
           for (const row of derivedRecords) {
             if (await tx.ingest(row)) records += 1;
             this._logLifecycleChange(daoId, previousLifecycle.get(String(row.proposal?.proposalId)), row.proposal, full ? "full_enumeration" : "incremental_refresh");
           }
           if (tx.reconcileCandidates) await tx.reconcileCandidates({ daoId, sourceId: source.id, records: fetchedCandidates });
           for (const row of fetchedCandidates) if (await tx.ingest(row)) records += 1;
+          if (daoId === "nouns" && source.id === "nouns-subgraph" && typeof source.exportCandidateCache === "function") {
+            const snapshot = source.exportCandidateCache();
+            if (snapshot) {
+              if (snapshot.snapshot !== finalHead || snapshot.blockHash !== fetchedCandidates.snapshot?.blockHash) {
+                throw new Error("candidate cache does not match fetched finalized snapshot");
+              }
+              await tx.setCandidateSnapshot({ daoId, sourceId: source.id, checkpointBlock: finalHead,
+                checkpointHash: snapshot.blockHash, snapshot });
+            }
+          }
+          if (daoId === "nouns" && source.id === "nouns-subgraph" && source.config.source.kind === "nouns-rpc"
+              && cutoverBlock == null && !checkpoint) {
+            await tx.freezeRpcCutoverBlock(daoId, source.id, source.fromBlock);
+          }
           await tx.setCheckpoint({ daoId, sourceId: source.id, nextBlock: Math.max(finalHead + 1, Number(checkpoint?.nextBlock || 0)), finalizedHead: finalHead, updatedAt: new Date().toISOString(), ...(full ? { lastFullScanAt: new Date().toISOString() } : {}), lastError: null });
         });
       } catch (error) {
