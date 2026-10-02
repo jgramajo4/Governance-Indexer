@@ -21,7 +21,7 @@ For one DAO: `npm run indexer -- sync --dao nouns|ens|railgun-eth`. Run full enu
 ## Environment
 
 - `DATABASE_URL` or libpq `PGHOST`, `PGPORT`, `PGDATABASE`, `PGUSER`, `PGPASSWORD`
-- `ETHEREUM_RPC_URL` — required when enabled DAOs need canonical Ethereum block provenance
+- `ETHEREUM_RPC_URL` — required for Nouns and other on-chain DAOs; must support Ethereum mainnet `eth_getLogs`, block-pinned calls, and block/receipt reads. Never put a credential-bearing URL in the public endpoint.
 - `INDEXER_ENABLED_DAOS` — comma-separated IDs, default `nouns,ens`
 - `INDEXER_CONFIRMATION_DEPTH` — default 64
 - `INDEXER_BLOCK_BATCH_SIZE` — default 5000; ENS may override via `ENS_PROPOSAL_BLOCK_BATCH_SIZE`
@@ -29,13 +29,15 @@ For one DAO: `npm run indexer -- sync --dao nouns|ens|railgun-eth`. Run full enu
 - `INDEXER_FULL_SCAN_INTERVAL_SECONDS` (21600), `INDEXER_WARM_REFRESH_SECONDS` (900)
 - `INDEXER_MAX_CHECKPOINT_AGE_SECONDS` (900), `API_HOST` (`0.0.0.0`), `API_PORT` (8080), `LOG_LEVEL` (`info`)
 - `RAILGUN_FROM_BLOCK` optionally overrides the verified default (15505853)
-- `NOUNS_SUBGRAPH_URL`, `PUBLIC_SOURCE_ENDPOINT`
+- `PUBLIC_SOURCE_ENDPOINT` — optional sanitized public provenance endpoint; canonical Nouns sync never requires a third-party subgraph
 
 Keep credentials in an external environment/secret manager. Never commit `.env` files or place credentials in endpoint URLs.
 
 ## Persistence and health
 
-Migrations `001_initial.sql` through `004_nouns_candidates.sql` are exclusively indexer-owned. `migrate` initializes a fresh database; `docker/init-db.sh` provisions least-privilege `gavel_indexer` and read-only `gavel_api` roles on a fresh Postgres volume. Checkpoints advance transactionally with successful indexing and monotonically. Failed attempts preserve progress and record redacted `lastError`. `updatedAt` tracks attempts more closely than successful progress; a future `last_success_at` is tracked in the roadmap.
+Migrations `001_initial.sql` through `007_nouns_proposal_refresh.sql` are exclusively indexer-owned. **Before the first RPC sync of an existing Nouns database**, run `migrate`: migration 005 records the current `nouns-subgraph` `next_block` as the immutable RPC cutover boundary in `governance_sources.config`; migration 006 adds a durable candidate reconstruction snapshot; migration 007 stores on-chain proposal refresh evidence separately from immutable historical subgraph raw records. None rewrites historical proposals, votes, or the checkpoint. The first candidate-cache build may scan candidate/creation logs from their deployment block; later restarts reuse the transactionally saved snapshot. Rollback to the old subgraph worker is not operational while its endpoint is gone; keep a database backup before migration and do not clear the cutover marker. A sync with an existing checkpoint but without the marker fails closed.
+
+`migrate` initializes a fresh database; `docker/init-db.sh` provisions least-privilege `gavel_indexer` and read-only `gavel_api` roles on a fresh Postgres volume. Checkpoints advance transactionally with successful indexing and monotonically. Failed attempts preserve progress and record redacted `lastError`. `updatedAt` tracks attempts more closely than successful progress; a future `last_success_at` is tracked in the roadmap.
 
 `/health` is liveness only. CLI `health` reports missing, stale, or failed enabled DAO checkpoints. A thrown error for one DAO does not stop safe later DAOs; the cycle still fails overall and the failed DAO remains unhealthy. A hung DAO can still block later DAOs (known follow-up).
 

@@ -114,13 +114,16 @@ test("migration applies against a real PostgreSQL server", { skip }, async () =>
       "SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename",
     )).rows.map((row) => row.tablename);
     assert.deepEqual(tables, [
-      "daos", "delegation_events", "governance_sources", "governance_targets", "proposal_actions",
+      "candidate_snapshots", "daos", "delegation_events", "governance_sources", "governance_targets", "nouns_proposal_refreshes", "proposal_actions",
       "proposals", "raw_governance_records", "schema_migrations", "sync_checkpoints", "vote_events",
     ]);
     const applied = (await store.pool.query("SELECT version FROM schema_migrations ORDER BY version")).rows.map((row) => row.version);
     assert.ok(applied.includes("001_initial"));
     assert.ok(applied.includes("003_proposal_lifecycle"));
     assert.ok(applied.includes("004_nouns_candidates"));
+    assert.ok(applied.includes("005_nouns_rpc_cutover"));
+    assert.ok(applied.includes("006_nouns_candidate_cache"));
+    assert.ok(applied.includes("007_nouns_proposal_refresh"));
   } finally { await store.close(); }
 });
 

@@ -33,7 +33,8 @@ const DAO_CONFIGS = Object.freeze({
     // preparation adapter has always used.
     currentGovernor: getAddress("0x6f3E6272A167e8AcCb32072d08E0957F9c79223d"),
     fromBlock: 12985438,
-    source: { id: "nouns-subgraph", kind: "nouns-subgraph", endpoint: "https://www.nouns.camp/subgraphs/nouns" },
+    // Keep the historical source ID: checkpoints and Gate provenance join on it.
+    source: { id: "nouns-subgraph", kind: "nouns-rpc", endpoint: "ethereum-json-rpc" },
   }),
 });
 

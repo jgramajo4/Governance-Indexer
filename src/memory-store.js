@@ -3,6 +3,7 @@ const { redactErrorMessage } = require("./redaction");
 const { canonicalGateActions } = require("./gate-action");
 const { canonicalCandidateTarget } = require("./candidate-target");
 const { DAO_CONFIGS } = require("./config");
+const { proposalContentHash } = require("./domain/nouns-history");
 
 function chainEventKey(row) {
   return `${row.chainId}:${String(row.contractAddress).toLowerCase()}:${String(row.transactionHash).toLowerCase()}:${row.logIndex}`;
@@ -63,9 +64,9 @@ function canonicalMaterial(row) { return JSON.stringify({ blockNumber: String(ro
 function immutableEventMaterial(row) { return JSON.stringify({ recordType: row.recordType, proposalId: row.proposalId || null, contentHash: row.contentHash || null, payload: row.payload }); }
 
 class MemoryGovernanceStore {
-  constructor({ clock = () => new Date() } = {}) { this.clock = clock; this.daos = new Map(); this.sources = new Map(); this.rawRecords = []; this.proposals = []; this.proposalActions = []; this.targets = new Map(); this.voteEvents = []; this.delegationEvents = []; this.checkpoints = new Map(); this._keys = new Set(); this._locks = new Map(); }
+  constructor({ clock = () => new Date() } = {}) { this.clock = clock; this.daos = new Map(); this.sources = new Map(); this.rawRecords = []; this.proposals = []; this.proposalActions = []; this.targets = new Map(); this.voteEvents = []; this.delegationEvents = []; this.checkpoints = new Map(); this.candidateSnapshots = new Map(); this.proposalRefreshes = new Map(); this._keys = new Set(); this._locks = new Map(); }
   async transaction(callback) {
-    const snapshot = structuredClone({ daos: this.daos, sources: this.sources, rawRecords: this.rawRecords, proposals: this.proposals, proposalActions: this.proposalActions, targets: this.targets, voteEvents: this.voteEvents, delegationEvents: this.delegationEvents, checkpoints: this.checkpoints, keys: this._keys });
+    const snapshot = structuredClone({ daos: this.daos, sources: this.sources, rawRecords: this.rawRecords, proposals: this.proposals, proposalActions: this.proposalActions, targets: this.targets, voteEvents: this.voteEvents, delegationEvents: this.delegationEvents, checkpoints: this.checkpoints, candidateSnapshots: this.candidateSnapshots, proposalRefreshes: this.proposalRefreshes, keys: this._keys });
     try { return await callback(this); } catch (error) { Object.assign(this, { ...snapshot, _keys: snapshot.keys }); throw error; }
   }
   async withSourceLock(daoId, sourceId, callback) {
@@ -77,6 +78,19 @@ class MemoryGovernanceStore {
   upsertDao(row) { this.daos.set(row.id, sanitizeConfig({ ...this.daos.get(row.id), ...row })); }
   upsertSource(row) { this.sources.set(`${row.daoId}:${row.id}`, sanitizeProvenance({ ...this.sources.get(`${row.daoId}:${row.id}`), ...row })); }
   getCheckpoint(daoId, sourceId) { return this.checkpoints.get(`${daoId}:${sourceId}`) || null; }
+  getCandidateSnapshot(daoId, sourceId) {
+    return structuredClone(this.candidateSnapshots.get(`${daoId}:${sourceId}`) || null);
+  }
+  setCandidateSnapshot({ daoId, sourceId, checkpointBlock, checkpointHash, snapshot }) {
+    if (!Number.isSafeInteger(checkpointBlock) || checkpointBlock < 0
+        || typeof checkpointHash !== 'string' || !/^0x[0-9a-fA-F]{64}$/.test(checkpointHash)
+        || snapshot?.snapshot !== checkpointBlock || snapshot?.blockHash !== checkpointHash) {
+      throw new TypeError('candidate snapshot checkpoint provenance is invalid');
+    }
+    const key = `${daoId}:${sourceId}`;
+    if (this.candidateSnapshots.has(key) && this.candidateSnapshots.get(key).checkpointBlock > checkpointBlock) return;
+    this.candidateSnapshots.set(key, structuredClone({ checkpointBlock, checkpointHash, snapshot }));
+  }
   setCheckpoint(row) {
     row = { ...row, lastError: row.lastError == null ? null : redactErrorMessage(row.lastError) };
     const key = `${row.daoId}:${row.sourceId}`; const existing = this.checkpoints.get(key);
@@ -85,6 +99,38 @@ class MemoryGovernanceStore {
       return;
     }
     this.checkpoints.set(key, { ...existing, ...row, lastFullScanAt: row.lastFullScanAt || existing?.lastFullScanAt || null });
+  }
+  refreshMaterializedProposal({ daoId, sourceId, proposalId, contentHash, snapshot, payload }) {
+    if (daoId !== 'nouns' || sourceId !== 'nouns-subgraph'
+        || !/^(0|[1-9][0-9]*)$/.test(String(proposalId))
+        || !/^[0-9a-fA-F]{64}$/.test(contentHash || '')
+        || !Number.isSafeInteger(snapshot?.blockNumber) || snapshot.blockNumber < 0
+        || !/^0x[0-9a-fA-F]{64}$/.test(snapshot?.blockHash || '')
+        || !payload || typeof payload !== 'object' || Array.isArray(payload)
+        || String(payload.id) !== String(proposalId) || typeof payload.description !== 'string'
+        || !['targets', 'values', 'signatures', 'calldatas'].every((key) => Array.isArray(payload[key]))
+        || !['values', 'signatures', 'calldatas'].every((key) => payload[key].length === payload.targets.length)
+        || proposalContentHash(payload) !== contentHash) {
+      throw new TypeError('invalid materialized Nouns proposal provenance');
+    }
+    const row = this.rawRecords.find((item) => item.daoId === daoId && item.sourceId === sourceId
+      && item.sourceRecordKey === `proposal:${proposalId}` && item.recordType === 'proposal'
+      && String(item.proposalId) === String(proposalId));
+    if (!row || BigInt(row.blockNumber) > BigInt(snapshot.blockNumber)
+        || BigInt(row.observedHead) > BigInt(snapshot.blockNumber)
+        || (Number(row.blockNumber) === snapshot.blockNumber && row.blockHash === snapshot.blockHash
+          && row.contentHash !== contentHash)) {
+      throw new Error(`materialized Nouns proposal provenance is stale or missing for ${proposalId}`);
+    }
+    const key = `${daoId}:${sourceId}:${proposalId}`;
+    const previous = this.proposalRefreshes.get(key);
+    if (previous && (previous.blockNumber > snapshot.blockNumber
+      || (previous.blockNumber === snapshot.blockNumber && previous.blockHash === snapshot.blockHash
+        && (previous.contentHash !== contentHash || immutableEventMaterial({ payload: previous.payload }) !== immutableEventMaterial({ payload }))))) {
+      throw new Error(`materialized Nouns proposal provenance is stale or conflicting for ${proposalId}`);
+    }
+    this.proposalRefreshes.set(key, structuredClone({ blockNumber: snapshot.blockNumber,
+      blockHash: snapshot.blockHash, contentHash, payload, ingestedAt: new Date(this.clock()).toISOString() }));
   }
   upsertProposal(row) {
     const actions = row.actions === undefined
@@ -136,6 +182,19 @@ class MemoryGovernanceStore {
           && immutableEventMaterial(existing) !== immutableEventMaterial(raw)) {
         throw new Error(`canonical candidate drift for ${key}`);
       }
+      const historicalRpc = refreshableProposal && existing.sourceKind === 'nouns-subgraph'
+        && ['nouns-governor-logs', 'nouns-rpc'].includes(raw.sourceKind)
+        && raw.daoId === 'nouns' && raw.sourceId === 'nouns-subgraph';
+      if (historicalRpc) {
+        if (String(raw.proposalId) !== String(existing.proposalId)
+            || String(raw.externalId) !== String(existing.externalId)
+            || BigInt(raw.blockNumber) < BigInt(existing.blockNumber)
+            || BigInt(raw.observedHead) < BigInt(existing.observedHead)) return false;
+        if (immutableEventMaterial(existing) !== immutableEventMaterial(raw)) {
+          throw new Error(`canonical event drift for ${key}`);
+        }
+        return false;
+      }
       const sameMaterial = refreshableProposal
         ? immutableEventMaterial(existing) === immutableEventMaterial(raw)
         : refreshableCandidate || canonicalMaterial(existing) === canonicalMaterial(raw);
@@ -179,6 +238,38 @@ class MemoryGovernanceStore {
     for (const key of removedKeys) this._keys.delete(`r:${key}`);
     for (const key of removedSourceKeys) this._keys.delete(`v:${key}`);
     for (const prefix of ["v", "d"]) for (const key of removedChainKeys) this._keys.delete(`${prefix}:${key}`);
+  }
+  reconcileRpcProposals({ daoId, sourceId, fromBlock, toBlock, cutoverBlock, createdIds }) {
+    if (daoId !== 'nouns' || sourceId !== 'nouns-subgraph'
+        || ![fromBlock, toBlock].every((n) => Number.isSafeInteger(n) && n >= 0)
+        || fromBlock > toBlock || (cutoverBlock != null && (!Number.isSafeInteger(cutoverBlock) || cutoverBlock < 0))
+        || !Array.isArray(createdIds) || !createdIds.every((id) => /^(0|[1-9][0-9]*)$/.test(String(id)))) {
+      throw new TypeError('invalid RPC proposal reconciliation range');
+    }
+    const present = new Set(createdIds.map(String));
+    const removed = this.rawRecords.filter((row) => {
+      if (row.daoId !== daoId || row.sourceId !== sourceId || row.recordType !== 'proposal'
+          || row.sourceRecordKey !== `proposal:${row.proposalId}`
+          || !['nouns-governor-logs', 'nouns-rpc'].includes(row.sourceKind)
+          || !/^(0|[1-9][0-9]*)$/.test(String(row.payload?.createdBlock ?? ''))) return false;
+      const created = BigInt(row.payload.createdBlock);
+      return created >= BigInt(fromBlock) && created <= BigInt(toBlock)
+        && created >= BigInt(cutoverBlock ?? fromBlock) && !present.has(String(row.proposalId));
+    });
+    const keys = new Set(removed.map(eventKey));
+    this.rawRecords = this.rawRecords.filter((row) => !keys.has(eventKey(row)));
+    for (const row of removed) {
+      this._keys.delete(`r:${eventKey(row)}`);
+      if (!this.rawRecords.some((other) => other.daoId === daoId && other.sourceId === sourceId
+          && other.recordType === 'proposal' && String(other.proposalId) === String(row.proposalId))) {
+        this.proposalRefreshes.delete(`${daoId}:${sourceId}:${row.proposalId}`);
+      }
+      if (!this.rawRecords.some((other) => other.daoId === daoId && other.recordType === 'proposal'
+          && String(other.proposalId) === String(row.proposalId))) {
+        this.proposals = this.proposals.filter((proposal) => !(proposal.daoId === daoId && String(proposal.proposalId) === String(row.proposalId)));
+        this.proposalActions = this.proposalActions.filter((action) => !(action.daoId === daoId && String(action.proposalId) === String(row.proposalId)));
+      }
+    }
   }
   reconcileProposals({ daoId, sourceId, records }) {
     const incoming = new Map(records.map((record) => [eventKey(record.raw), sanitizeProvenance({ ...record.raw, proposalId: record.raw.proposalId || record.proposal?.proposalId || null, contentHash: record.raw.contentHash || record.proposal?.contentHash || null })]));
@@ -255,10 +346,13 @@ class MemoryGovernanceStore {
   async getGateProposal(daoId, proposalId) {
     const proposal = this.proposals.find((row) => row.daoId === daoId && row.proposalId === proposalId);
     if (!proposal) return null;
-    const provenance = this.rawRecords
+    const rawProvenance = this.rawRecords
       .filter((row) => row.daoId === daoId && row.proposalId === proposalId && row.recordType === "proposal"
         && row.sourceId === "nouns-subgraph" && row.sourceRecordKey === `proposal:${proposalId}`
-        && row.contentHash === proposal.contentHash && row.blockHash && row.ingestedAt)
+        && row.contentHash === proposal.contentHash && row.blockHash && row.ingestedAt);
+    const refresh = this.proposalRefreshes.get(`${daoId}:nouns-subgraph:${proposalId}`);
+    const provenance = [...rawProvenance, ...(refresh && refresh.contentHash === proposal.contentHash
+      && refresh.payload.description === proposal.normalized?.description ? [refresh] : [])]
       .sort((a, b) => BigInt(a.blockNumber) < BigInt(b.blockNumber) ? 1 : -1)[0];
     if (!provenance) return null;
     return {

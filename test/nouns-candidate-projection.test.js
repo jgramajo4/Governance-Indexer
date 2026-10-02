@@ -89,7 +89,8 @@ test('candidate persistence rejects content rewrites at the same canonical snaps
 test('worker rejects divergent empty target snapshots before candidate reconciliation', async () => {
   const store = new MemoryGovernanceStore();
   const source = {
-    id: 'nouns-subgraph', fromBlock: 200, replayBlocks: 0, config: DAO_CONFIGS.nouns,
+    id: 'nouns-subgraph', fromBlock: 200, replayBlocks: 0,
+    config: { ...DAO_CONFIGS.nouns, source: { ...DAO_CONFIGS.nouns.source, kind: 'nouns-subgraph' } },
     async head() { return 200; }, async fetchRange() { return []; },
     async fetchProposals() { return snapshotRows([], BLOCK_HASH); },
     async fetchCandidates() { return snapshotRows([], `0x${'ef'.repeat(32)}`); },
@@ -101,7 +102,8 @@ test('candidate ingestion failure cannot advance a healthy checkpoint', async ()
   const store = new MemoryGovernanceStore();
   const malformed = record({ kind: 'proposal' });
   const source = {
-    id: 'nouns-subgraph', fromBlock: 200, replayBlocks: 0, config: DAO_CONFIGS.nouns,
+    id: 'nouns-subgraph', fromBlock: 200, replayBlocks: 0,
+    config: { ...DAO_CONFIGS.nouns, source: { ...DAO_CONFIGS.nouns.source, kind: 'nouns-subgraph' } },
     async head() { return 200; }, async fetchRange() { return []; },
     async fetchProposals() { return snapshotRows([]); },
     async fetchCandidates() { return snapshotRows([malformed]); },

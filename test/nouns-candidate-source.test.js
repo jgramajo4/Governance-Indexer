@@ -51,7 +51,7 @@ function proposalCandidateHash({ proposer, targets, values, signatures, calldata
 
 function log(iface, event, args, { blockNumber, transactionHash = TX, index = 0, transactionIndex = 0, address = NOUNS_DAO_DATA_PROXY }) {
   const encoded = iface.encodeEventLog(iface.getEvent(event), args);
-  return { address, blockNumber, transactionHash, transactionIndex, index, topics: encoded.topics, data: encoded.data };
+  return { address, blockNumber, blockHash: BLOCK_HASH, transactionHash, transactionIndex, index, topics: encoded.topics, data: encoded.data };
 }
 
 function candidateEvent(event, overrides = {}) {
@@ -93,7 +93,7 @@ function proposalEvent(candidate, id = 42n, overrides = {}) {
   assert.equal(hash.toLowerCase(), candidate.encodedProposalHash.toLowerCase(), 'fixture candidate hash');
   return log(proposalInterface, 'ProposalCreated', [id, candidate.proposer, candidate.targets, candidate.values,
     candidate.signatures, candidate.calldatas, 100n, 200n, candidate.description], {
-    address: DAO_CONFIGS.nouns.contractAddress,
+    address: DAO_CONFIGS.nouns.currentGovernor,
     blockNumber: overrides.blockNumber ?? NOUNS_CANDIDATE_START_BLOCK + 5,
     transactionHash: overrides.transactionHash ?? TX2,
   });
@@ -163,7 +163,8 @@ test('canonical candidate logs reconstruct latest content, exact actions, title,
   assert.equal(raw.logIndex, 0);
   assert.equal(raw.sourceKind, 'nouns-candidate-logs');
   assert.deepEqual(records.snapshot, { blockNumber: SNAPSHOT, blockHash: BLOCK_HASH });
-  assert.deepEqual(blockCalls.sort((a, b) => a - b), [NOUNS_CANDIDATE_START_BLOCK + 1, SNAPSHOT]);
+  assert.deepEqual(blockCalls.sort((a, b) => a - b), [NOUNS_CANDIDATE_START_BLOCK, NOUNS_CANDIDATE_START_BLOCK + 1,
+    NOUNS_CANDIDATE_START_BLOCK + 1, NOUNS_CANDIDATE_START_BLOCK + 5, SNAPSHOT]);
   assert.deepEqual(calls.slice(0, 2), [['send', 'eth_chainId'], ['getBlock', SNAPSHOT]], 'chain and pinned hash are checked before logs');
   const filters = calls.filter(([kind]) => kind === 'getLogs').map(([, filter]) => filter);
   assert.equal(filters[0].address, NOUNS_DAO_DATA_PROXY);
