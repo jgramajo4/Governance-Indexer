@@ -29,6 +29,7 @@ For one DAO: `npm run indexer -- sync --dao nouns|ens|railgun-eth`. Run full enu
 - `INDEXER_FULL_SCAN_INTERVAL_SECONDS` (21600), `INDEXER_WARM_REFRESH_SECONDS` (900)
 - `INDEXER_MAX_CHECKPOINT_AGE_SECONDS` (900), `API_HOST` (`0.0.0.0`), `API_PORT` (8080), `LOG_LEVEL` (`info`)
 - `RAILGUN_FROM_BLOCK` optionally overrides the verified default (15505853)
+- `GAVEL_INDEX_CORS_ORIGINS` — optional comma-separated exact HTTPS origins for browser GET/HEAD. Unset/blank keeps the old no-CORS behavior. Example: `https://gavel.0773h.com`. Invalid entries fail API startup; no wildcard, URL path/query/fragment, or credentials. This setting belongs on the standalone API service, not the workers.
 - `PUBLIC_SOURCE_ENDPOINT` — optional sanitized public provenance endpoint; canonical Nouns sync never requires a third-party subgraph
 
 Keep credentials in an external environment/secret manager. Never commit `.env` files or place credentials in endpoint URLs.

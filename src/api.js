@@ -102,11 +102,44 @@ function requestPath(value) {
   catch { return String(value || "").split(/[?#]/, 1)[0] || "/"; }
 }
 
-function createReadOnlyApi({ store, logger = null }) {
+function allowedCorsOrigins(value) {
+  if (value === undefined || value === "" || typeof value === "string" && !value.trim()) return new Set();
+  if (typeof value !== "string") throw new TypeError("GAVEL_INDEX_CORS_ORIGINS must be a comma-separated list of HTTPS origins");
+  return new Set(value.split(",").map((entry) => {
+    const origin = entry.trim();
+    let url;
+    try { url = new URL(origin); } catch { /* invalid origin */ }
+    if (!url || url.protocol !== "https:" || url.origin !== origin || url.username || url.password
+      || url.pathname !== "/" || url.search || url.hash) {
+      throw new TypeError("GAVEL_INDEX_CORS_ORIGINS must contain only exact HTTPS origins (no paths, query, fragment or wildcard)");
+    }
+    return origin;
+  }));
+}
+
+function createReadOnlyApi({ store, logger = null, corsOrigins = process.env.GAVEL_INDEX_CORS_ORIGINS }) {
+  const origins = allowedCorsOrigins(corsOrigins);
   const log = logger || { info() {}, error() {} };
   return http.createServer(async (req, res) => {
     const started = Date.now();
     try {
+      if (origins.size) {
+        res.setHeader("Vary", "Origin");
+        if (req.method === "OPTIONS" && req.headers.origin && req.headers["access-control-request-method"]) {
+          res.setHeader("Vary", "Origin, Access-Control-Request-Method, Access-Control-Request-Headers");
+          if (origins.has(req.headers.origin) && ["GET", "HEAD"].includes(req.headers["access-control-request-method"])
+            && !req.headers["access-control-request-headers"]) {
+            res.setHeader("Access-Control-Allow-Origin", req.headers.origin);
+            res.setHeader("Access-Control-Allow-Methods", "GET, HEAD");
+            res.writeHead(204, { "cache-control": "no-store" });
+            res.end();
+          } else json(res, 403, { error: "cors_preflight_denied" });
+          return;
+        }
+        if (["GET", "HEAD"].includes(req.method) && origins.has(req.headers.origin)) {
+          res.setHeader("Access-Control-Allow-Origin", req.headers.origin);
+        }
+      }
       if (!["GET", "HEAD"].includes(req.method)) return json(res, 405, { error: "method_not_allowed" });
       const url = new URL(req.url, "http://localhost"); const parts = url.pathname.split("/").filter(Boolean);
       if (["/health", "/healthz"].includes(url.pathname)) return json(res, 200, { ok: true });
