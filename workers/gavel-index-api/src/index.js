@@ -11,6 +11,15 @@ const FORWARDED_REQUEST_HEADERS = [
   "range",
 ];
 
+// Sent upstream only on OPTIONS so the Node Index API, the single CORS policy
+// owner, can decide a preflight. The Worker keeps no Origin allowlist.
+const FORWARDED_PREFLIGHT_HEADERS = [
+  "access-control-request-method",
+  "access-control-request-headers",
+];
+
+const EDGE_CACHE_HEADER = "x-gavel-edge-cache";
+
 const STRIPPED_RESPONSE_HEADERS = [
   "server",
   "via",
@@ -35,7 +44,25 @@ function json(status, body, headers = {}) {
 
 function isAllowedRoute(request) {
   const url = new URL(request.url);
-  return (request.method === "GET" || request.method === "HEAD") && url.pathname.startsWith("/v1/");
+  // OPTIONS is passed through (only under /v1/) so the Node Index API answers
+  // CORS preflight itself; the Worker never fabricates a preflight success.
+  return (request.method === "GET" || request.method === "HEAD" || request.method === "OPTIONS")
+    && url.pathname.startsWith("/v1/");
+}
+
+// Browser/CORS traffic: any request carrying Origin, and every OPTIONS. These
+// responses are origin-specific, so they bypass the URL-only shared cache and
+// keep the Node API's own Cache-Control.
+function isBrowserCorsRequest(request) {
+  return request.headers.has("origin") || request.method === "OPTIONS";
+}
+
+// Token-aware merge: adds Origin to Vary without dropping the upstream's
+// existing tokens (e.g. Access-Control-Request-Method on preflights).
+function varyWithOrigin(value) {
+  const tokens = (value || "").split(",").map((token) => token.trim()).filter(Boolean);
+  if (tokens.some((token) => token === "*" || token.toLowerCase() === "origin")) return tokens.join(", ");
+  return [...tokens, "Origin"].join(", ");
 }
 
 function headerByteLength(headers) {
@@ -54,6 +81,14 @@ function originRequest(request, originUrl, accessClientId, accessClientSecret) {
     const value = request.headers.get(name);
     if (value) headers.set(name, value);
   }
+  // Forward Origin byte-for-byte when present; never synthesize one. The Node
+  // API is the only Origin allowlist.
+  if (request.headers.has("origin")) headers.set("origin", request.headers.get("origin"));
+  if (request.method === "OPTIONS") {
+    for (const name of FORWARDED_PREFLIGHT_HEADERS) {
+      if (request.headers.has(name)) headers.set(name, request.headers.get(name));
+    }
+  }
   // These credentials are Worker secrets for the private Access-protected
   // origin. They are never accepted from or exposed to public callers.
   if (accessClientId && accessClientSecret) {
@@ -63,13 +98,23 @@ function originRequest(request, originUrl, accessClientId, accessClientSecret) {
   return new Request(origin, { method: request.method, headers, redirect: "manual" });
 }
 
-function publicResponse(response, cacheTtlSeconds) {
+function publicResponse(response, cacheTtlSeconds, { browserCors = false, edgeCache = "BYPASS" } = {}) {
   const headers = new Headers(response.headers);
   for (const name of STRIPPED_RESPONSE_HEADERS) headers.delete(name);
   for (const [name] of headers) {
     if (name.startsWith("x-internal-") || name.startsWith("x-origin-") || name.startsWith("cf-access-")) headers.delete(name);
   }
-  headers.set("cache-control", `public, max-age=${cacheTtlSeconds}, s-maxage=${cacheTtlSeconds}`);
+  if (browserCors) {
+    // Keep the origin's cache semantics (the Node API sends no-store); fail
+    // closed to no-store if an upstream response ever omits Cache-Control.
+    if (!headers.has("cache-control")) headers.set("cache-control", "no-store");
+  } else {
+    headers.set("cache-control", `public, max-age=${cacheTtlSeconds}, s-maxage=${cacheTtlSeconds}`);
+  }
+  // The edge response now depends on Origin (cache path and Cache-Control), so
+  // downstream caches must key on it even when the origin omitted Vary.
+  headers.set("vary", varyWithOrigin(headers.get("vary")));
+  headers.set(EDGE_CACHE_HEADER, edgeCache);
   return new Response(response.body, { status: response.status, statusText: response.statusText, headers });
 }
 
@@ -79,7 +124,10 @@ function cacheKey(request) {
 }
 
 function isCacheableRequest(request) {
+  // Invariant: a request carrying Origin never reads or writes the URL-only
+  // shared cache, so an ACAO for one Origin can never be served to another.
   return request.method === "GET"
+    && !isBrowserCorsRequest(request)
     && !request.headers.has("accept")
     && !request.headers.has("range")
     && !request.headers.has("if-modified-since")
@@ -129,7 +177,11 @@ export function createWorker({ fetchImpl = fetch, cache = globalThis.caches?.def
       const shouldCache = isCacheableRequest(request);
       if (shouldCache) {
         const cached = await cache.match(key);
-        if (cached) return cached;
+        if (cached) {
+          const hit = new Response(cached.body, cached);
+          hit.headers.set(EDGE_CACHE_HEADER, "HIT");
+          return hit;
+        }
       }
 
       try {
@@ -138,7 +190,10 @@ export function createWorker({ fetchImpl = fetch, cache = globalThis.caches?.def
           log.error("origin_redirect", { method: request.method, path: new URL(request.url).pathname, status: response.status });
           return json(502, { error: "upstream_unavailable" });
         }
-        const sanitized = publicResponse(response, cacheTtlSeconds);
+        const sanitized = publicResponse(response, cacheTtlSeconds, {
+          browserCors: isBrowserCorsRequest(request),
+          edgeCache: shouldCache ? "MISS" : "BYPASS",
+        });
         if (shouldCache && sanitized.status === 200) await cache.put(key, sanitized.clone());
         return sanitized;
       } catch (error) {
