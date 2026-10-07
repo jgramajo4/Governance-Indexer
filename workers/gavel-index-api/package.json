@@ -1,0 +1,14 @@
+{
+  "name": "gavel-index-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Public, read-only Cloudflare Worker front door for the Gavel governance index.",
+  "scripts": {
+    "test": "node --test test/*.test.js",
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4.129.0"
+  }
+}

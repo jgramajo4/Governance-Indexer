@@ -1,0 +1,29 @@
+name = "gavel-index-api"
+main = "src/index.js"
+compatibility_date = "2025-09-01"
+workers_dev = false
+
+# Public hostname and DNS/route are intentionally configured in the Cloudflare dashboard
+# or with Wrangler after the zone exists. Do not expose the private origin directly.
+
+[vars]
+# SET ME: seconds to cache successful GET responses. Recommended: 45.
+CACHE_TTL_SECONDS = "45"
+# SET ME: per-IP request budget in each rolling one-minute Durable Object window. Recommended: 120.
+MAX_REQUESTS_PER_MINUTE = "120"
+# SET ME: maximum raw query-string length in bytes/characters. Recommended: 2048.
+MAX_QUERY_LENGTH = "2048"
+# SET ME: maximum aggregate request-header size in bytes. Recommended: 16384.
+MAX_HEADER_BYTES = "16384"
+
+# SET ME AS A SECRET, NOT HERE:
+#   wrangler secret put ORIGIN_URL
+# Example value for the next step only: https://<private-tunnel-hostname>
+
+[[durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "RateLimiter"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RateLimiter"]
